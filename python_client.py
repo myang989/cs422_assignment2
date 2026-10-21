@@ -6,8 +6,29 @@
 
 import socket
 import secrets
+import json
+import struct
+from enum import IntEnum
 
-PARAM_EXCHANGE = 9
+#iperf states
+class TestState(IntEnum):
+    # Success / Flow states
+    TEST_START       = 1    # server -> client
+    TEST_RUNNING     = 2    # server -> client
+    TEST_END         = 4    # client -> server: "my sending is finished"
+    PARAM_EXCHANGE   = 9    # server -> client: "send your parameters"
+    CREATE_STREAMS   = 10   # server -> client: "open your data connection"
+    SERVER_TERMINATE = 11   # server -> client: test aborted by the server
+    EXCHANGE_RESULTS = 13   # server -> client: "send your results JSON"
+    DISPLAY_RESULTS  = 14   # server -> client: results exchange finished
+    IPERF_DONE       = 16   # client -> server: "I'm done, closing"
+    
+    # Error states
+    ACCESS_DENIED    = -1   # server -> client: busy with another test
+    SERVER_ERROR     = -2   # server -> client: followed by two 4-byte ints (error code, errno)
+
+
+
 # this function recieves exactly buffersize bytes into a buffer byte array and returns it.
 def recv_exact(socket, buffersize):
     need_to_fill = buffersize
@@ -53,47 +74,76 @@ def read_state(socket):
     # read single byte as a signed int
     return int.from_bytes(data, "big", signed=True)
 
+# tests the returned state with an expected goal state for param exchange.
+def expect_state(socket, goal):
+    state = read_state(socket)
+    if state == goal:
+        return 0
+    else:
+        if state == -1:
+            # server busy
+            print("busy")
+        elif state == -2:
+            # server error
+            print("server error")
+        else:
+            # protocol mismatch
+            print("general error")
+        raise ConnectionError(f"The expected state {TestState(goal).name} was not returned but rather {TestState(state).name}")
+
+
+def send_json(socket, obj):
+    # encode our json data dict into a string literal json and then into bytes
+    data = json.dumps(obj).encode('utf-8')
+
+    byte_count = struct.pack("!I", len(data))
+    socket.sendall(byte_count)
+    socket.sendall(data)
+
+
 # make the cookie
 cookie = make_cookie()
 assert len(cookie) == 37
 # create a socket for ipv4 with a two way stream like tcp
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client_socket.settimeout(5.0)
+control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+control_socket.settimeout(5.0)
 
 # set tcp no delay
 # disable nagles algo to send data immediatly w/o buffering delays (we deliver immediatly even if the paylod is small)
 # with nagle on if we send a small message, we don't send a next unless we get an ACK but that ACK might be delayed by the server! 
-client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+control_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 # connect to #iperf3 -c 185.93.1.65 -p 5201
-client_socket.connect(("195.181.162.195", 5201))
+control_socket.connect(("195.181.162.195", 5201))
 
 # send cookie
-client_socket.sendall(cookie)
+control_socket.sendall(cookie)
 
-# read one state byte
-state = read_state(client_socket)
+# read one state byte and expect param_exchange
+expect_state(control_socket, TestState.PARAM_EXCHANGE)
 
-#check for paramexchange (9)
-if state == 9:
-    # ok
-    print("ok")
-elif state == -1:
-    # server busy
-    print("busy")
-elif state == -2:
-    # server error
-    print("server error")
-else:
-    # protocol mismatch
-    print("general error")
+print("ok")
+params = {
+    "tcp": True,           # TCP test, not UDP (json.dumps turns True into true)
+    "omit": 0,             # don't leave out any seconds at the start
+    "time": 10,            # test duration in seconds
+    "num": 0,              # 0 = stop by time, not after a byte count
+    "blockcount": 0,       # 0 = stop by time, not after a block count
+    "parallel": 1,         # one data stream
+    "len": 131072,         # 128 KB per write on the data socket (iperf3's TCP default)
+    "client_version": "cs422-client",  # informational only; the server never reads it
+}
+
 
 # send param json 
+send_json(control_socket, params)
 
+expect_state(control_socket, TestState.CREATE_STREAMS)
+print("params sent")
 # receive exactly 1024 bytes of data
-#data = recv_exact(client_socket, 1024)
+#data = recv_exact(control_socket, 1024)
 
 # decode bytes for output
 #print("Received from server:", data.decode("utf-8"))
 
-client_socket.close()
+control_socket.close()
