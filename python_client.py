@@ -9,6 +9,8 @@ import secrets
 import json
 import struct
 from enum import IntEnum
+import time
+import select
 
 #iperf states
 class TestState(IntEnum):
@@ -155,6 +157,50 @@ expect_state(control_socket, TestState.TEST_RUNNING)
 print("test running")
 
 
+class IperfError(Exception):
+    """A test against one server failed. The message says why."""
 
-data_socket.close()
-control_socket.close()
+
+def send_state(sock, state):
+    # One signed byte, like iperf_set_send_state() (iperf_api.c:2064)
+    sock.sendall(state.to_bytes(1, "big", signed=True))
+
+
+def recv_json(sock, max_len=1_000_000):
+    # 4-byte big-endian length, then that many bytes of JSON (JSON_read(), iperf_api.c:3197)
+    (length,) = struct.unpack("!I", recv_exact(sock, 4))
+    if length == 0 or length > max_len:      # JSON_read() also rejects 0 and oversized lengths
+        raise IperfError(f"bad JSON length {length}")
+    return json.loads(recv_exact(sock, length).decode())
+
+
+def raise_for_state(sock, state, expected=None):
+    # Mirrors the error cases in iperf_handle_message_client() (iperf_client_api.c:303)
+    if state == TestState.SERVER_ERROR:
+        # Two 4-byte big-endian ints follow: iperf error code, then OS errno (cleanup_server())
+        (code,) = struct.unpack("!i", recv_exact(sock, 4))
+        (err,) = struct.unpack("!i", recv_exact(sock, 4))
+        raise IperfError(f"SERVER_ERROR: iperf error code {code}, errno {err}")
+    if state == TestState.ACCESS_DENIED:
+        raise IperfError("ACCESS_DENIED: server is busy")
+    if state == TestState.SERVER_TERMINATE:
+        raise IperfError("SERVER_TERMINATE: server ended the test")
+    name = TestState.STATE_NAMES.get(state, "unknown")
+    raise IperfError(f"unexpected state {state} ({name}), expected {expected}")
+
+
+duration = 10
+
+start = time.monotonic()
+deadline = start + duration
+len_bytes = 131072
+bytes_sent = 0
+block = bytes(len_bytes)
+while time.monotonic() < deadline:
+    data_socket.sendall(block)
+    bytes_sent += len_bytes
+    ready_to_read, _, _ = select.select([control_socket], [], [], 0)
+    if ready_to_read:
+        state = read_state(control_socket)
+        raise_for_state(control_socket, state)
+elapsed = time.monotonic() - start
