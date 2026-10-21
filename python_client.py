@@ -24,3 +24,27 @@ def recv_exact(socket, buffersize):
 
     return bytes(my_buffer)
 
+import secrets
+
+
+# make the cookie
+# create control socket with timeout and connect
+# set tcp_nodelay
+# send cookie
+# read one state byte
+# send param json 
+
+
+# create a socket for ipv4 with a two way stream like tcp
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+# connect to #iperf3 -c 185.93.1.65 -p 5201
+client_socket.connect(("185.93.1.65", 5201))
+
+# receive exactly 1024 bytes of data
+data = recv_exact(client_socket, 1024)
+
+# decode bytes for output
+print("Received from server:", data.decode("utf-8"))
+
+client_socket.close()
