@@ -231,13 +231,25 @@ def run_test(host, port, duration, block_size, interval, cc=None):
         send_state(control_socket, TestState.IPERF_DONE)
 
         server_bytes = server_results["streams"][0]["bytes"]
-        print(f"sent {bytes_sent} B in {elapsed:.2f} s; server received {server_bytes} B "
-            f"(difference {bytes_sent - server_bytes} B)")
+        return {
+            "host": host,
+            "port": port,
+            "duration_requested": duration,
+            "elapsed": elapsed,            # actual seconds from TEST_RUNNING to end of send loop
+            "block_size": block_size,
+            "bytes_sent": bytes_sent,      # bytes handed to sendall()
+            "server_bytes": server_bytes,  # bytes the server reports receiving
+            "cc_requested": cc,            # None until Q2/Q3
+            "samples": [],                 # filled with TCP_INFO samples in Lesson 3
+        }
     finally:
         data_socket.close()  
         control_socket.close()
 
 
-  # connect to #iperf3 -c 185.93.1.65 -p 5201
-        #t(("195.181.162.195", 5201))
+
+
+r = run_test("195.181.162.195", 5201, duration=10, block_size=BLOCK_SIZE, interval=0.2)
+print(f"sent {r['bytes_sent']} B in {r['elapsed']:.2f} s; server received {r['server_bytes']} B "
+      f"(difference {r['bytes_sent'] - r['server_bytes']} B)")
 
