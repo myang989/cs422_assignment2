@@ -11,6 +11,7 @@ import struct
 from enum import IntEnum
 import time
 import select
+import random, csv, re
 
 #iperf states
 class TestState(IntEnum):
@@ -252,4 +253,47 @@ def run_test(host, port, duration, block_size, interval, cc=None):
 r = run_test("195.181.162.195", 5201, duration=10, block_size=BLOCK_SIZE, interval=0.2)
 print(f"sent {r['bytes_sent']} B in {r['elapsed']:.2f} s; server received {r['server_bytes']} B "
       f"(difference {r['bytes_sent'] - r['server_bytes']} B)")
+
+
+# loop through a random list of n ips and run an iperf3 test on each
+ip_addrs_and_hosts = []
+with open('listed_iperf3_servers.csv', newline='') as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        ip = row['IP/HOST']
+        host = row['PORT']
+        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
+            continue
+        ip_addrs_and_hosts.append((ip, host))
+
+random.shuffle(ip_addrs_and_hosts)  # shuffle once instead of random.choice each time
+print(f"Read {len(ip_addrs_and_hosts)} IPs")
+
+good = 0
+results = {}
+n = 10
+
+
+for test_ip, test_host in ip_addrs_and_hosts:
+    if good >= n:
+        break
+    try:
+        # run the iperf
+        run_test(test_ip, test_host, duration=10, block_size=BLOCK_SIZE, interval=0.2)
+        good += 1
+    except Exception as e:
+        print(f"The following error was caught: {e}")
+        # log and handle errors
+
+
+
+
+
+
+# we need n succesful
+# record failures
+# calculate good put
+# plot tcp stats
+
+
 
