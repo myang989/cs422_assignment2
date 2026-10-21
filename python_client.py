@@ -29,7 +29,8 @@ class TestState(IntEnum):
     ACCESS_DENIED    = -1   # server -> client: busy with another test
     SERVER_ERROR     = -2   # server -> client: followed by two 4-byte ints (error code, errno)
 
-
+#consts 
+BLOCK_SIZE = 131072
 
 # this function recieves exactly buffersize bytes into a buffer byte array and returns it.
 def recv_exact(socket, buffersize):
@@ -102,61 +103,6 @@ def send_json(socket, obj):
     socket.sendall(byte_count)
     socket.sendall(data)
 
-
-# make the cookie
-cookie = make_cookie()
-assert len(cookie) == 37
-# create a socket for ipv4 with a two way stream like tcp
-control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-control_socket.settimeout(5.0)
-
-# set tcp no delay
-# disable nagles algo to send data immediatly w/o buffering delays (we deliver immediatly even if the paylod is small)
-# with nagle on if we send a small message, we don't send a next unless we get an ACK but that ACK might be delayed by the server! 
-control_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-# connect to #iperf3 -c 185.93.1.65 -p 5201
-control_socket.connect(("195.181.162.195", 5201))
-
-# send cookie
-control_socket.sendall(cookie)
-
-# read one state byte and expect param_exchange
-expect_state(control_socket, TestState.PARAM_EXCHANGE)
-
-print("ok")
-params = {
-    "tcp": True,           # TCP test, not UDP (json.dumps turns True into true)
-    "omit": 0,             # don't leave out any seconds at the start
-    "time": 10,            # test duration in seconds
-    "num": 0,              # 0 = stop by time, not after a byte count
-    "blockcount": 0,       # 0 = stop by time, not after a block count
-    "parallel": 1,         # one data stream
-    "len": 131072,         # 128 KB per write on the data socket (iperf3's TCP default)
-    "client_version": "cs422-client",  # informational only; the server never reads it
-}
-
-
-# send param json 
-send_json(control_socket, params)
-
-expect_state(control_socket, TestState.CREATE_STREAMS)
-print("params sent")
-
-# create the data socket
-data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-data_socket.settimeout(5.0)
-data_socket.connect(("195.181.162.195", 5201))
-
-# send cookie
-data_socket.sendall(cookie)
-
-expect_state(control_socket, TestState.TEST_START)
-print("test start")
-expect_state(control_socket, TestState.TEST_RUNNING)
-print("test running")
-
-
 class IperfError(Exception):
     """A test against one server failed. The message says why."""
 
@@ -189,18 +135,109 @@ def raise_for_state(sock, state, expected=None):
     raise IperfError(f"unexpected state {state} ({name}), expected {expected}")
 
 
-duration = 10
+def run_test(host, port, duration, block_size, interval, cc=None):
+    # make the cookie
+    cookie = make_cookie()
+    assert len(cookie) == 37
+    
+    # create a socket for ipv4 with a two way stream like tcp
+    control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        control_socket.settimeout(5.0)
 
-start = time.monotonic()
-deadline = start + duration
-len_bytes = 131072
-bytes_sent = 0
-block = bytes(len_bytes)
-while time.monotonic() < deadline:
-    data_socket.sendall(block)
-    bytes_sent += len_bytes
-    ready_to_read, _, _ = select.select([control_socket], [], [], 0)
-    if ready_to_read:
-        state = read_state(control_socket)
-        raise_for_state(control_socket, state)
-elapsed = time.monotonic() - start
+        # set tcp no delay
+        # disable nagles algo to send data immediatly w/o buffering delays (we deliver immediatly even if the paylod is small)
+        # with nagle on if we send a small message, we don't send a next unless we get an ACK but that ACK might be delayed by the server! 
+        control_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        control_socket.connect((host, port))
+
+        # send cookie
+        control_socket.sendall(cookie)
+
+        # read one state byte and expect param_exchange
+        expect_state(control_socket, TestState.PARAM_EXCHANGE)
+
+        print("ok")
+        params = {
+            "tcp": True,           # TCP test, not UDP (json.dumps turns True into true)
+            "omit": 0,             # don't leave out any seconds at the start
+            "time": duration,            # test duration in seconds
+            "num": 0,              # 0 = stop by time, not after a byte count
+            "blockcount": 0,       # 0 = stop by time, not after a block count
+            "parallel": 1,         # one data stream
+            "len": block_size,         # 128 KB per write on the data socket (iperf3's TCP default)
+            "client_version": "cs422-client",  # informational only; the server never reads it
+        }
+
+
+        # send param json 
+        send_json(control_socket, params)
+
+        expect_state(control_socket, TestState.CREATE_STREAMS)
+        print("params sent")
+
+        # create the data socket
+        data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        data_socket.settimeout(5.0)
+        data_socket.connect((host, port))
+
+        # send cookie
+        data_socket.sendall(cookie)
+
+        expect_state(control_socket, TestState.TEST_START)
+        print("test start")
+        expect_state(control_socket, TestState.TEST_RUNNING)
+        print("test running")
+
+        # loop and send blocks
+
+        start = time.monotonic()
+        deadline = start + duration
+        bytes_sent = 0
+        block = bytes(block_size)
+        while time.monotonic() < deadline:
+            data_socket.sendall(block)
+            bytes_sent += block_size
+            ready_to_read, _, _ = select.select([control_socket], [], [], 0)
+            if ready_to_read:
+                state = read_state(control_socket)
+                raise_for_state(control_socket, state)
+        elapsed = time.monotonic() - start
+
+        #ending TEST_END case like in iperf_server_api.c
+        send_state(control_socket, TestState.TEST_END)
+        data_socket.close()
+
+        expect_state(control_socket, TestState.EXCHANGE_RESULTS)
+
+        # Client sends its results first
+        # get_results() (iperf_api.c:2977) rejects the message if any of these fields is missing.
+        client_results = {
+            "cpu_util_total": 0, "cpu_util_user": 0, "cpu_util_system": 0,   # not measured
+            "sender_has_retransmits": 0,       # becomes 1 once we read TCP_INFO retransmits
+            "streams": [{
+                "id": 1,                       # server's first stream id (iperf_add_stream())
+                "bytes": bytes_sent,
+                "retransmits": 0,
+                "jitter": 0, "errors": 0, "packets": 0,   # UDP-only fields
+                "start_time": 0, "end_time": elapsed,
+            }],
+        }
+        send_json(control_socket, client_results)
+        server_results = recv_json(control_socket)
+
+        expect_state(control_socket, TestState.DISPLAY_RESULTS)
+        send_state(control_socket, TestState.IPERF_DONE)
+
+        server_bytes = server_results["streams"][0]["bytes"]
+        print(f"sent {bytes_sent} B in {elapsed:.2f} s; server received {server_bytes} B "
+            f"(difference {bytes_sent - server_bytes} B)")
+    finally:
+        data_socket.close()  
+        control_socket.close()
+
+
+  # connect to #iperf3 -c 185.93.1.65 -p 5201
+        #t(("195.181.162.195", 5201))
+
