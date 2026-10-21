@@ -140,10 +140,21 @@ send_json(control_socket, params)
 
 expect_state(control_socket, TestState.CREATE_STREAMS)
 print("params sent")
-# receive exactly 1024 bytes of data
-#data = recv_exact(control_socket, 1024)
 
-# decode bytes for output
-#print("Received from server:", data.decode("utf-8"))
+# create the data socket
+data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+data_socket.settimeout(5.0)
+data_socket.connect(("195.181.162.195", 5201))
 
+# send cookie
+data_socket.sendall(cookie)
+
+expect_state(control_socket, TestState.TEST_START)
+print("test start")
+expect_state(control_socket, TestState.TEST_RUNNING)
+print("test running")
+
+
+
+data_socket.close()
 control_socket.close()
