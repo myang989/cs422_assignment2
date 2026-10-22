@@ -143,6 +143,7 @@ def run_test(host, port, duration, block_size, interval, cc=None):
     
     # create a socket for ipv4 with a two way stream like tcp
     control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    data_socket = None
     try:
         control_socket.settimeout(5.0)
 
@@ -244,15 +245,31 @@ def run_test(host, port, duration, block_size, interval, cc=None):
             "samples": [],                 # filled with TCP_INFO samples in Lesson 3
         }
     finally:
-        data_socket.close()  
+        if data_socket:
+            data_socket.close()  
         control_socket.close()
 
 
 
 
-r = run_test("195.181.162.195", 5201, duration=10, block_size=BLOCK_SIZE, interval=0.2)
-print(f"sent {r['bytes_sent']} B in {r['elapsed']:.2f} s; server received {r['server_bytes']} B "
-      f"(difference {r['bytes_sent'] - r['server_bytes']} B)")
+#r = run_test("195.181.162.195", 5201, duration=10, block_size=BLOCK_SIZE, interval=0.2)
+#print(f"sent {r['bytes_sent']} B in {r['elapsed']:.2f} s; server received {r['server_bytes']} B "
+#      f"(difference {r['bytes_sent'] - r['server_bytes']} B)")
+
+# a simple helper to fomart the hosts
+def parse_port(port_str: str) -> int:
+    """
+    Parses a port string. Returns a single random int if given a hyphenated range, 
+    or a static int if given a single number string.
+    """
+    # Clean any whitespace just in case
+    port_str = port_str.strip()
+    
+    if "-" in port_str:
+        start, end = map(int, port_str.split("-"))
+        return random.randint(start, end)
+    else:
+        return int(port_str)
 
 
 # loop through a random list of n ips and run an iperf3 test on each
@@ -264,7 +281,7 @@ with open('listed_iperf3_servers.csv', newline='') as f:
         host = row['PORT']
         if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
             continue
-        ip_addrs_and_hosts.append((ip, host))
+        ip_addrs_and_hosts.append((ip, parse_port(host)))
 
 random.shuffle(ip_addrs_and_hosts)  # shuffle once instead of random.choice each time
 print(f"Read {len(ip_addrs_and_hosts)} IPs")
