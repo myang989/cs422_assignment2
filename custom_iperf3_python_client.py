@@ -12,8 +12,14 @@ from enum import IntEnum
 import time
 import select
 import random, csv, re
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import argparse
+import os
 
-#iperf states
+# iperf states
 class TestState(IntEnum):
     # Success / Flow states
     TEST_START       = 1    # server -> client
@@ -32,6 +38,7 @@ class TestState(IntEnum):
 
 #consts 
 BLOCK_SIZE = 131072
+TCPI_BYTES_ACKED_OFFSET = 120
 
 # this function recieves exactly buffersize bytes into a buffer byte array and returns it.
 def recv_exact(socket, buffersize):
@@ -72,8 +79,8 @@ def make_cookie() -> str:
     msg = "".join(cookie_chars)
     return msg.encode('utf-8')
 
+ # this function reads exactly one state byte
 def read_state(socket):
-    # read one state byte
     data = recv_exact(socket, 1)
     # read single byte as a signed int
     return int.from_bytes(data, "big", signed=True)
@@ -83,19 +90,9 @@ def expect_state(socket, goal):
     state = read_state(socket)
     if state == goal:
         return 0
-    else:
-        if state == -1:
-            # server busy
-            print("busy")
-        elif state == -2:
-            # server error
-            print("server error")
-        else:
-            # protocol mismatch
-            print("general error")
-        raise ConnectionError(f"The expected state {TestState(goal).name} was not returned but rather {TestState(state).name}")
-
-
+    raise_for_state(socket, state, TestState(goal).name)
+ 
+# this function sends the json param
 def send_json(socket, obj):
     # encode our json data dict into a string literal json and then into bytes
     data = json.dumps(obj).encode('utf-8')
@@ -134,6 +131,25 @@ def raise_for_state(sock, state, expected=None):
         raise IperfError("SERVER_TERMINATE: server ended the test")
     name = TestState.STATE_NAMES.get(state, "unknown")
     raise IperfError(f"unexpected state {state} ({name}), expected {expected}")
+
+def read_bytes_acked(sock):
+    info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+    if len(info) < TCPI_BYTES_ACKED_OFFSET + 8:
+        raise IperfError(f"TCP_INFO too short ({len(info)} B) for tcpi_bytes_acked")
+    (acked,) = struct.unpack_from("=Q", info, TCPI_BYTES_ACKED_OFFSET)
+    return acked
+ 
+ 
+def take_sample(sock, start, samples):
+    now = time.monotonic()
+    acked = read_bytes_acked(sock)
+    sample = {"t_s": now - start, "bytes_acked": acked, "goodput_bps": None}
+    if samples:
+        prev = samples[-1]
+        dt = sample["t_s"] - prev["t_s"]
+        if dt > 0:
+            sample["goodput_bps"] = (acked - prev["bytes_acked"]) * 8 / dt
+    samples.append(sample)
 
 
 def run_test(host, port, duration, block_size, interval, cc=None):
@@ -272,45 +288,151 @@ def parse_port(port_str: str) -> int:
         return int(port_str)
 
 
-# loop through a random list of n ips and run an iperf3 test on each
-ip_addrs_and_hosts = []
-with open('listed_iperf3_servers.csv', newline='') as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        ip = row['IP/HOST']
-        host = row['PORT']
-        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
+def load_servers(path, host_column, port_column, default_port):
+    servers = []
+    with open(path, newline='') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ip = (row.get(host_column) or "").strip()
+            if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
+                continue
+            servers.append((ip, parse_port(row.get(port_column), default_port)))
+    return servers
+
+
+
+def select_and_run(servers, n, max_attempts, duration, block_size, interval, cc, attempts_log):
+    successes = []
+    for attempt, (host, ports) in enumerate(servers[:max_attempts], start=1):
+        if len(successes) >= n:
+            break
+        port = random.choice(ports)
+        t0 = time.monotonic()
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            result = run_test(host, port, duration, block_size, interval, cc)
+        except (IperfError, OSError, ValueError, KeyError) as e:
+            reason = f"{type(e).__name__}: {e}"
+            attempts_log.append({"attempt": attempt, "timestamp": stamp, "host": host, "port": port,
+                                 "outcome": "fail", "reason": reason,
+                                 "attempt_s": round(time.monotonic() - t0, 3)})
+            print(f"[{attempt}] FAIL {host}:{port} - {reason}")
             continue
-        ip_addrs_and_hosts.append((ip, parse_port(host)))
-
-random.shuffle(ip_addrs_and_hosts)  # shuffle once instead of random.choice each time
-print(f"Read {len(ip_addrs_and_hosts)} IPs")
-
-good = 0
-results = {}
-n = 10
-
-
-for test_ip, test_host in ip_addrs_and_hosts:
-    if good >= n:
-        break
-    try:
-        # run the iperf
-        run_test(test_ip, test_host, duration=10, block_size=BLOCK_SIZE, interval=0.2)
-        good += 1
-    except Exception as e:
-        print(f"The following error was caught: {e}")
-        # log and handle errors
-
-
-
-
-
-
-# we need n succesful
-# record failures
-# calculate good put
-# plot tcp stats
-
-
-
+        attempts_log.append({"attempt": attempt, "timestamp": stamp, "host": host, "port": port,
+                             "outcome": "ok", "reason": "",
+                             "attempt_s": round(time.monotonic() - t0, 3)})
+        successes.append(result)
+        print(f"[{attempt}] OK   {host}:{port} - {len(successes)}/{n}")
+    return successes
+ 
+ 
+def write_csv(path, rows, fieldnames):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+ 
+ 
+def summarize(results, run_id):
+    rows = []
+    for r in results:
+        g = np.array([s["goodput_bps"] for s in r["samples"] if s["goodput_bps"] is not None]) / 1e6
+        if g.size == 0:
+            continue
+        rows.append({"run_id": run_id, "host": r["host"], "port": r["port"], "cc": r["cc_used"],
+                     "n_samples": int(g.size),
+                     "min_mbps": round(float(np.min(g)), 3),
+                     "median_mbps": round(float(np.median(g)), 3),
+                     "mean_mbps": round(float(np.mean(g)), 3),
+                     "p95_mbps": round(float(np.percentile(g, 95)), 3)})
+    return rows
+ 
+ 
+def plot_goodput(results, path):
+    k = len(results)
+    if k == 0:
+        return
+    ncols = 2 if k > 1 else 1
+    nrows = (k + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 2.8 * nrows), squeeze=False, sharex=True)
+    for ax in axes.flat[k:]:
+        ax.set_visible(False)
+    for ax, r in zip(axes.flat, results):
+        pts = [(s["t_s"], s["goodput_bps"] / 1e6) for s in r["samples"] if s["goodput_bps"] is not None]
+        if pts:
+            t, g = zip(*pts)
+            ax.plot(t, g, linewidth=1)
+        ax.set_title(f'{r["host"]}:{r["port"]} ({r["cc_used"]})', fontsize=9)
+        ax.set_ylabel("goodput (Mbit/s)")
+        ax.set_ylim(bottom=0)
+        ax.grid(alpha=0.3)
+    for ax in axes[-1]:
+        ax.set_xlabel("time since TEST_RUNNING (s)")
+    fig.tight_layout()
+    fig.savefig(path)
+    plt.close(fig)
+ 
+ 
+def main():
+    p = argparse.ArgumentParser(description="iperf3-compatible TCP goodput client (Assignment 2, Q1)")
+    p.add_argument("--servers", default="listed_iperf3_servers.csv", help="CSV server list")
+    p.add_argument("--host-column", default="IP/HOST")
+    p.add_argument("--port-column", default="PORT")
+    p.add_argument("--default-port", type=int, default=5201)
+    p.add_argument("-n", "--num-destinations", type=int, default=10)
+    p.add_argument("--max-attempts", type=int, default=None, help="default: 3 * n")
+    p.add_argument("-t", "--duration", type=int, default=60, help="seconds per destination")
+    p.add_argument("-i", "--interval", type=float, default=0.2, help="sampling interval (s)")
+    p.add_argument("-l", "--block-size", type=int, default=BLOCK_SIZE)
+    p.add_argument("--cc", default=None, help="congestion control on the data socket (default: OS default)")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("-o", "--out", default="results/q1")
+    args = p.parse_args()
+ 
+    seed = args.seed if args.seed is not None else int(time.time())
+    random.seed(seed)
+    run_id = time.strftime("%Y%m%d-%H%M%S")
+    max_attempts = args.max_attempts or 3 * args.num_destinations
+    os.makedirs(args.out, exist_ok=True)
+ 
+    servers = load_servers(args.servers, args.host_column, args.port_column, args.default_port)
+    random.shuffle(servers)
+    print(f"Read {len(servers)} servers; seed {seed}; run {run_id}")
+ 
+    attempts_log = []
+    results = select_and_run(servers, args.num_destinations, max_attempts, args.duration,
+                             args.block_size, args.interval, args.cc, attempts_log)
+ 
+    write_csv(os.path.join(args.out, f"attempts_{run_id}.csv"), attempts_log,
+              ["attempt", "timestamp", "host", "port", "outcome", "reason", "attempt_s"])
+    write_csv(os.path.join(args.out, f"chosen_servers_{run_id}.csv"),
+              [{"host": r["host"], "port": r["port"]} for r in results], ["host", "port"])
+    sample_rows = []
+    for r in results:
+        for s in r["samples"]:
+            sample_rows.append({"run_id": run_id, "host": r["host"], "port": r["port"], "cc": r["cc_used"],
+                                "interval_s": args.interval, "t_s": round(s["t_s"], 6),
+                                "bytes_acked": s["bytes_acked"],
+                                "goodput_bps": "" if s["goodput_bps"] is None else round(s["goodput_bps"], 1)})
+    write_csv(os.path.join(args.out, f"samples_{run_id}.csv"), sample_rows,
+              ["run_id", "host", "port", "cc", "interval_s", "t_s", "bytes_acked", "goodput_bps"])
+    write_csv(os.path.join(args.out, f"tests_{run_id}.csv"),
+              [{k: r[k] for k in ("host", "port", "cc_requested", "cc_used", "duration_requested",
+                                  "elapsed", "block_size", "bytes_sent", "server_bytes")} for r in results],
+              ["host", "port", "cc_requested", "cc_used", "duration_requested", "elapsed",
+               "block_size", "bytes_sent", "server_bytes"])
+    summary = summarize(results, run_id)
+    write_csv(os.path.join(args.out, f"summary_{run_id}.csv"), summary,
+              ["run_id", "host", "port", "cc", "n_samples", "min_mbps", "median_mbps", "mean_mbps", "p95_mbps"])
+    plot_goodput(results, os.path.join(args.out, f"goodput_{run_id}.pdf"))
+ 
+    print(f"\nrequested {args.num_destinations}, succeeded {len(results)}, "
+          f"attempts {len(attempts_log)}, shortfall {args.num_destinations - len(results)}")
+    print(f"{'host':<16}{'port':>6}{'cc':>8}{'min':>9}{'median':>9}{'mean':>9}{'p95':>9}  (Mbit/s)")
+    for row in summary:
+        print(f"{row['host']:<16}{row['port']:>6}{row['cc']:>8}{row['min_mbps']:>9.2f}"
+              f"{row['median_mbps']:>9.2f}{row['mean_mbps']:>9.2f}{row['p95_mbps']:>9.2f}")
+ 
+ 
+if __name__ == "__main__":
+    main()
