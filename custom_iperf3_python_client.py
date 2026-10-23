@@ -379,14 +379,18 @@ def select_and_run(servers, n, max_attempts, duration, block_size, interval, cc,
         print(f"[{attempt}] OK   {host}:{port} - {len(successes)}/{n}")
     return successes
 
-
+"""
+Helper to write test output to a csv
+"""
 def write_csv(path, rows, fieldnames):
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
-
+"""
+Creates the summary statistics of the tests for printing
+"""
 def summarize(results, run_id):
     rows = []
     for r in results:
@@ -401,7 +405,9 @@ def summarize(results, run_id):
                      "p95_mbps": round(float(np.percentile(g, 95)), 3)})
     return rows
 
-
+"""
+Plots out goodput vs time graphs for each server
+"""
 def plot_goodput(results, path):
     k = len(results)
     if k == 0:
@@ -428,6 +434,7 @@ def plot_goodput(results, path):
 
 
 def main():
+    # collect command line args and then parse it into p
     p = argparse.ArgumentParser(description="iperf3-compatible TCP goodput client (Assignment 2, Q1)")
     p.add_argument("--servers", default="listed_iperf3_servers.csv", help="CSV server list")
     p.add_argument("--host-column", default="IP/HOST")
@@ -443,24 +450,29 @@ def main():
     p.add_argument("-o", "--out", default="results/q1")
     args = p.parse_args()
 
+    # set seed for random and create output dir (we want reproduceable randomness)
     seed = args.seed if args.seed is not None else int(time.time())
     random.seed(seed)
     run_id = time.strftime("%Y%m%d-%H%M%S")
     max_attempts = args.max_attempts or 3 * args.num_destinations
     os.makedirs(args.out, exist_ok=True)
 
+    # randomize the order of our possible servers
     servers = load_servers(args.servers, args.host_column, args.port_column, args.default_port)
     random.shuffle(servers)
     print(f"Read {len(servers)} servers; seed {seed}; run {run_id}")
 
+    # run the tests for all servers.
     attempts_log = []
     results = select_and_run(servers, args.num_destinations, max_attempts, args.duration,
                              args.block_size, args.interval, args.cc, attempts_log)
 
+    # write the output (attempts and chosen servers) 
     write_csv(os.path.join(args.out, f"attempts_{run_id}.csv"), attempts_log,
               ["attempt", "timestamp", "host", "port", "outcome", "reason", "attempt_s"])
     write_csv(os.path.join(args.out, f"chosen_servers_{run_id}.csv"),
               [{"host": r["host"], "port": r["port"]} for r in results], ["host", "port"])
+    
     sample_rows = []
     for r in results:
         for s in r["samples"]:
@@ -468,6 +480,8 @@ def main():
                                 "interval_s": args.interval, "t_s": round(s["t_s"], 6),
                                 "bytes_acked": s["bytes_acked"],
                                 "goodput_bps": "" if s["goodput_bps"] is None else round(s["goodput_bps"], 1)})
+            
+    # write the goodput sampling output and summary stats
     write_csv(os.path.join(args.out, f"samples_{run_id}.csv"), sample_rows,
               ["run_id", "host", "port", "cc", "interval_s", "t_s", "bytes_acked", "goodput_bps"])
     write_csv(os.path.join(args.out, f"tests_{run_id}.csv"),
@@ -480,6 +494,7 @@ def main():
               ["run_id", "host", "port", "cc", "n_samples", "min_mbps", "median_mbps", "mean_mbps", "p95_mbps"])
     plot_goodput(results, os.path.join(args.out, f"goodput_{run_id}.pdf"))
 
+    # shell output
     print(f"\nrequested {args.num_destinations}, succeeded {len(results)}, "
           f"attempts {len(attempts_log)}, shortfall {args.num_destinations - len(results)}")
     print(f"{'host':<16}{'port':>6}{'cc':>8}{'min':>9}{'median':>9}{'mean':>9}{'p95':>9}  (Mbit/s)")
