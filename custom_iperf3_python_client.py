@@ -1,8 +1,6 @@
-# first we need to write a function that recieves data from a connected socket
-# recv(bufszie) where bufsize is the max number of bytes to read in a single call. 
-# so if less data is availabe we return what is there immedialty
-# if we want to rexieve an exact ammmount of data
-# we need to continue calling recv with the difference of what we needed and what we got.
+"""
+This is a custom iperf3 client that sends data to an iperf3 server
+"""
 
 import socket
 import secrets
@@ -11,15 +9,20 @@ import struct
 from enum import IntEnum
 import time
 import select
-import random, csv, re
+import argparse
+import csv
+import os
+import random
+import re
+
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import argparse
-import os
 
-# iperf states
+"""
+These states let both parties (client and server) know what is currently happening
+"""
 class TestState(IntEnum):
     # Success / Flow states
     TEST_START       = 1    # server -> client
@@ -31,16 +34,21 @@ class TestState(IntEnum):
     EXCHANGE_RESULTS = 13   # server -> client: "send your results JSON"
     DISPLAY_RESULTS  = 14   # server -> client: results exchange finished
     IPERF_DONE       = 16   # client -> server: "I'm done, closing"
-    
+
     # Error states
     ACCESS_DENIED    = -1   # server -> client: busy with another test
     SERVER_ERROR     = -2   # server -> client: followed by two 4-byte ints (error code, errno)
 
-#consts 
+"""
+Some constant values
+"""
 BLOCK_SIZE = 131072
 TCPI_BYTES_ACKED_OFFSET = 120
 
-# this function recieves exactly buffersize bytes into a buffer byte array and returns it.
+"""
+This function recieves exactly buffersize bytes into a buffer byte array and returns it. 
+Nessecary because recv(size) will fill up to size but not nessecarilty the entirety of it.
+"""
 def recv_exact(socket, buffersize):
     need_to_fill = buffersize
     my_buffer = bytearray()
@@ -58,17 +66,18 @@ def recv_exact(socket, buffersize):
 
     return bytes(my_buffer)
 
-
-# this function generates a secure random cookie string using random chars like iperf_util.cs make_cookie()
+"""
+This function generates a secure random cookie string using random chars like iperf_util.cs make_cookie()
+Required to establish a connection and allows for multiple parallel streams to link up with the correct control connection.
+"""
 def make_cookie() -> str:
     COOKIE_SIZE = 37 # size of iper3 cookiesize defined in iperf.h
-    
     rndchars = b"abcdefghijklmnopqrstuvwxyz234567"
     alphabet_len = len(rndchars)
 
     # Generates COOKIE_SIZE cryptographically secure random bytes
     random_bytes = secrets.token_bytes(COOKIE_SIZE)
-    
+
     # We process up to (COOKIE_SIZE - 1) just like the C code loop boundary
     cookie_chars = []
     for i in range(COOKIE_SIZE - 1):
@@ -79,49 +88,44 @@ def make_cookie() -> str:
     msg = "".join(cookie_chars)
     return msg.encode('utf-8')
 
- # this function reads exactly one state byte
+"""
+This function reads exactly one state byte
+"""
 def read_state(socket):
     data = recv_exact(socket, 1)
     # read single byte as a signed int
     return int.from_bytes(data, "big", signed=True)
 
-# tests the returned state with an expected goal state for param exchange.
+"""
+This function sends the client state to the server (one signed byte)
+"""
+def send_state(sock, state):
+    # One signed byte, like iperf_set_send_state() (iperf_api.c:2064)
+    sock.sendall(state.to_bytes(1, "big", signed=True))
+
+"""
+Tests the returned state with an expected goal state (for param exchange and further communication).
+If we get something we didn't expect we can raise an error.
+"""
 def expect_state(socket, goal):
     state = read_state(socket)
     if state == goal:
         return 0
     raise_for_state(socket, state, TestState(goal).name)
- 
-# this function sends the json param
-def send_json(socket, obj):
-    # encode our json data dict into a string literal json and then into bytes
-    data = json.dumps(obj).encode('utf-8')
 
-    byte_count = struct.pack("!I", len(data))
-    socket.sendall(byte_count)
-    socket.sendall(data)
-
+"""
+This defines an iperf error (just wraps a python exception)
+"""
 class IperfError(Exception):
     """A test against one server failed. The message says why."""
 
-
-def send_state(sock, state):
-    # One signed byte, like iperf_set_send_state() (iperf_api.c:2064)
-    sock.sendall(state.to_bytes(1, "big", signed=True))
-
-
-def recv_json(sock, max_len=1_000_000):
-    # 4-byte big-endian length, then that many bytes of JSON (JSON_read(), iperf_api.c:3197)
-    (length,) = struct.unpack("!I", recv_exact(sock, 4))
-    if length == 0 or length > max_len:      # JSON_read() also rejects 0 and oversized lengths
-        raise IperfError(f"bad JSON length {length}")
-    return json.loads(recv_exact(sock, length).decode())
-
-
+"""
+This function raises an error due to faulty state
+"""
 def raise_for_state(sock, state, expected=None):
-    # Mirrors the error cases in iperf_handle_message_client() (iperf_client_api.c:303)
+    # mirrors the error cases in iperf_handle_message_client() (iperf_client_api.c:303)
     if state == TestState.SERVER_ERROR:
-        # Two 4-byte big-endian ints follow: iperf error code, then OS errno (cleanup_server())
+        # two 4-byte big-endian ints follow: iperf error code, then OS errno (cleanup_server())
         (code,) = struct.unpack("!i", recv_exact(sock, 4))
         (err,) = struct.unpack("!i", recv_exact(sock, 4))
         raise IperfError(f"SERVER_ERROR: iperf error code {code}, errno {err}")
@@ -129,17 +133,52 @@ def raise_for_state(sock, state, expected=None):
         raise IperfError("ACCESS_DENIED: server is busy")
     if state == TestState.SERVER_TERMINATE:
         raise IperfError("SERVER_TERMINATE: server ended the test")
-    name = TestState.STATE_NAMES.get(state, "unknown")
+    try:
+        name = TestState(state).name
+    except ValueError:
+        name = "unknown"
     raise IperfError(f"unexpected state {state} ({name}), expected {expected}")
 
+
+"""
+This function sends our param json to the server
+"""
+def send_json(socket, obj):
+    # encode our json data dict into a string literal json and then into bytes
+    data = json.dumps(obj).encode('utf-8')
+    # get the length in bytes of the enocded json
+    byte_count = struct.pack("!I", len(data))
+    socket.sendall(byte_count)
+    socket.sendall(data)
+
+"""
+This function recives a param json from the server
+"""
+def recv_json(sock, max_len=1_000_000):
+    # first recv 4-byte big-endian to get the length
+    # then recv length many bytes of JSON (JSON_read(), iperf_api.c:3197)
+    (length,) = struct.unpack("!I", recv_exact(sock, 4))
+    if length == 0 or length > max_len:      # JSON_read() also rejects 0 and oversized lengths
+        raise IperfError(f"bad JSON length {length}")
+    return json.loads(recv_exact(sock, length).decode())
+
+"""
+This function reads from the kernel, internal TCP stats for the given socket
+"""
 def read_bytes_acked(sock):
+    # give the current tcp info for this socket
     info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
     if len(info) < TCPI_BYTES_ACKED_OFFSET + 8:
         raise IperfError(f"TCP_INFO too short ({len(info)} B) for tcpi_bytes_acked")
     (acked,) = struct.unpack_from("=Q", info, TCPI_BYTES_ACKED_OFFSET)
+    # acked is the total number of bytes that the client has sent to the server and that the server has acknowleged (sent back an ACK)
     return acked
- 
- 
+
+"""
+This function takes a sample of the cumulative bytes acked and takes the difference between it and the number of bytes from the previous sample
+basically at regular intervals we find:
+(diff in bytes / time diff) * 8
+"""
 def take_sample(sock, start, samples):
     now = time.monotonic()
     acked = read_bytes_acked(sock)
@@ -152,11 +191,17 @@ def take_sample(sock, start, samples):
     samples.append(sample)
 
 
+"""
+Runs a single iperf3 test on a given (host, port) tuple
+"""
 def run_test(host, port, duration, block_size, interval, cc=None):
+    
+    # part 1 - connect and send cookie
+    
     # make the cookie
     cookie = make_cookie()
     assert len(cookie) == 37
-    
+
     # create a socket for ipv4 with a two way stream like tcp
     control_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     data_socket = None
@@ -165,13 +210,15 @@ def run_test(host, port, duration, block_size, interval, cc=None):
 
         # set tcp no delay
         # disable nagles algo to send data immediatly w/o buffering delays (we deliver immediatly even if the paylod is small)
-        # with nagle on if we send a small message, we don't send a next unless we get an ACK but that ACK might be delayed by the server! 
+        # with nagle on if we send a small message, we don't send a next unless we get an ACK but that ACK might be delayed by the server!
         control_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
         control_socket.connect((host, port))
 
         # send cookie
         control_socket.sendall(cookie)
+
+        # part 1 - parameter exchange
 
         # read one state byte and expect param_exchange
         expect_state(control_socket, TestState.PARAM_EXCHANGE)
@@ -189,7 +236,7 @@ def run_test(host, port, duration, block_size, interval, cc=None):
         }
 
 
-        # send param json 
+        # send param json
         send_json(control_socket, params)
 
         expect_state(control_socket, TestState.CREATE_STREAMS)
@@ -198,31 +245,43 @@ def run_test(host, port, duration, block_size, interval, cc=None):
         # create the data socket
         data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         data_socket.settimeout(5.0)
+        if cc is not None:
+            data_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, cc.encode())
+        raw_cc = data_socket.getsockopt(socket.IPPROTO_TCP, socket.TCP_CONGESTION, 16)
+        cc_used = raw_cc.split(b"\x00", 1)[0].decode()
         data_socket.connect((host, port))
 
         # send cookie
         data_socket.sendall(cookie)
 
+        # part 3 - test and data tranmission
         expect_state(control_socket, TestState.TEST_START)
         print("test start")
         expect_state(control_socket, TestState.TEST_RUNNING)
         print("test running")
 
         # loop and send blocks
-
         start = time.monotonic()
         deadline = start + duration
         bytes_sent = 0
         block = bytes(block_size)
+        samples = []
+        take_sample(data_socket, start, samples)
+        next_sample = start + interval
         while time.monotonic() < deadline:
             data_socket.sendall(block)
             bytes_sent += block_size
+            if time.monotonic() >= next_sample:
+                take_sample(data_socket, start, samples)
+                next_sample += interval
             ready_to_read, _, _ = select.select([control_socket], [], [], 0)
             if ready_to_read:
                 state = read_state(control_socket)
                 raise_for_state(control_socket, state)
         elapsed = time.monotonic() - start
 
+        # part 4  - tear down
+        
         #ending TEST_END case like in iperf_server_api.c
         send_state(control_socket, TestState.TEST_END)
         data_socket.close()
@@ -258,36 +317,30 @@ def run_test(host, port, duration, block_size, interval, cc=None):
             "bytes_sent": bytes_sent,      # bytes handed to sendall()
             "server_bytes": server_bytes,  # bytes the server reports receiving
             "cc_requested": cc,            # None until Q2/Q3
-            "samples": [],                 # filled with TCP_INFO samples in Lesson 3
+            "cc_used": cc_used,
+            "samples": samples,
         }
     finally:
-        if data_socket:
-            data_socket.close()  
+        if data_socket is not None:
+            data_socket.close()
         control_socket.close()
 
+"""
+Helper function to format ports
+"""
+def parse_ports(field, default_port):
+    field = (field or "").strip()
+    m = re.match(r'^(\d+)\s*-\s*(\d+)$', field)
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        return list(range(lo, hi + 1))
+    if field.isdigit():
+        return [int(field)]
+    return [default_port]
 
-
-
-#r = run_test("195.181.162.195", 5201, duration=10, block_size=BLOCK_SIZE, interval=0.2)
-#print(f"sent {r['bytes_sent']} B in {r['elapsed']:.2f} s; server received {r['server_bytes']} B "
-#      f"(difference {r['bytes_sent'] - r['server_bytes']} B)")
-
-# a simple helper to fomart the hosts
-def parse_port(port_str: str) -> int:
-    """
-    Parses a port string. Returns a single random int if given a hyphenated range, 
-    or a static int if given a single number string.
-    """
-    # Clean any whitespace just in case
-    port_str = port_str.strip()
-    
-    if "-" in port_str:
-        start, end = map(int, port_str.split("-"))
-        return random.randint(start, end)
-    else:
-        return int(port_str)
-
-
+"""
+Helper function to read servers and ports from csv
+"""
 def load_servers(path, host_column, port_column, default_port):
     servers = []
     with open(path, newline='') as f:
@@ -296,11 +349,12 @@ def load_servers(path, host_column, port_column, default_port):
             ip = (row.get(host_column) or "").strip()
             if not re.match(r'^(\d{1,3}\.){3}\d{1,3}$', ip):
                 continue
-            servers.append((ip, parse_port(row.get(port_column), default_port)))
+            servers.append((ip, parse_ports(row.get(port_column), default_port)))
     return servers
 
-
-
+"""
+Run an iperf test on n servers
+"""
 def select_and_run(servers, n, max_attempts, duration, block_size, interval, cc, attempts_log):
     successes = []
     for attempt, (host, ports) in enumerate(servers[:max_attempts], start=1):
@@ -324,15 +378,15 @@ def select_and_run(servers, n, max_attempts, duration, block_size, interval, cc,
         successes.append(result)
         print(f"[{attempt}] OK   {host}:{port} - {len(successes)}/{n}")
     return successes
- 
- 
+
+
 def write_csv(path, rows, fieldnames):
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
- 
- 
+
+
 def summarize(results, run_id):
     rows = []
     for r in results:
@@ -346,8 +400,8 @@ def summarize(results, run_id):
                      "mean_mbps": round(float(np.mean(g)), 3),
                      "p95_mbps": round(float(np.percentile(g, 95)), 3)})
     return rows
- 
- 
+
+
 def plot_goodput(results, path):
     k = len(results)
     if k == 0:
@@ -371,8 +425,8 @@ def plot_goodput(results, path):
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
- 
- 
+
+
 def main():
     p = argparse.ArgumentParser(description="iperf3-compatible TCP goodput client (Assignment 2, Q1)")
     p.add_argument("--servers", default="listed_iperf3_servers.csv", help="CSV server list")
@@ -388,21 +442,21 @@ def main():
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("-o", "--out", default="results/q1")
     args = p.parse_args()
- 
+
     seed = args.seed if args.seed is not None else int(time.time())
     random.seed(seed)
     run_id = time.strftime("%Y%m%d-%H%M%S")
     max_attempts = args.max_attempts or 3 * args.num_destinations
     os.makedirs(args.out, exist_ok=True)
- 
+
     servers = load_servers(args.servers, args.host_column, args.port_column, args.default_port)
     random.shuffle(servers)
     print(f"Read {len(servers)} servers; seed {seed}; run {run_id}")
- 
+
     attempts_log = []
     results = select_and_run(servers, args.num_destinations, max_attempts, args.duration,
                              args.block_size, args.interval, args.cc, attempts_log)
- 
+
     write_csv(os.path.join(args.out, f"attempts_{run_id}.csv"), attempts_log,
               ["attempt", "timestamp", "host", "port", "outcome", "reason", "attempt_s"])
     write_csv(os.path.join(args.out, f"chosen_servers_{run_id}.csv"),
@@ -425,14 +479,14 @@ def main():
     write_csv(os.path.join(args.out, f"summary_{run_id}.csv"), summary,
               ["run_id", "host", "port", "cc", "n_samples", "min_mbps", "median_mbps", "mean_mbps", "p95_mbps"])
     plot_goodput(results, os.path.join(args.out, f"goodput_{run_id}.pdf"))
- 
+
     print(f"\nrequested {args.num_destinations}, succeeded {len(results)}, "
           f"attempts {len(attempts_log)}, shortfall {args.num_destinations - len(results)}")
     print(f"{'host':<16}{'port':>6}{'cc':>8}{'min':>9}{'median':>9}{'mean':>9}{'p95':>9}  (Mbit/s)")
     for row in summary:
         print(f"{row['host']:<16}{row['port']:>6}{row['cc']:>8}{row['min_mbps']:>9.2f}"
               f"{row['median_mbps']:>9.2f}{row['mean_mbps']:>9.2f}{row['p95_mbps']:>9.2f}")
- 
- 
+
+
 if __name__ == "__main__":
     main()
