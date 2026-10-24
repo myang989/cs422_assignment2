@@ -1,5 +1,0 @@
-attempt,timestamp,host,port,outcome,reason,attempt_s
-1,2026-10-22T02:40:22,23.249.60.154,30007,fail,ConnectionRefusedError: [Errno 111] Connection refused,0.172
-2,2026-10-22T02:40:22,37.19.206.20,5201,fail,IperfError: ACCESS_DENIED: server is busy,0.161
-3,2026-10-22T02:40:22,102.214.66.19,5201,ok,,11.714
-4,2026-10-22T02:40:34,169.150.252.2,5201,ok,,11.615

@@ -1,3 +1,0 @@
-host,port,cc_requested,cc_used,duration_requested,elapsed,block_size,bytes_sent,server_bytes
-102.214.66.19,5201,,cubic,10,10.012709778000044,131072,60817408,59650920
-169.150.252.2,5201,,cubic,10,10.155094945999963,131072,13107200,11534336
