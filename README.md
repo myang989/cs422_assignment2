@@ -62,4 +62,4 @@ To rerun on the same destinations as an earlier run:
 
 ## AI use
 
-AI was used to generate some of the code used to run expirements. This includes part of the iperf3 client such as helper methods like read_csv and summarize. AI also helped in plots.py and tcpinfo.py, Additaionly AI was used to verify that the code I wrote was bug free and provided assitance to guide me to a more correct answer. Finally I used AI to help me understand the material that the HW assignments cover.
+AI was used to generate some of the code used to run experiments. This includes part of the iperf3 client such as helper methods like read_csv and summarize. AI also helped in plots.py and tcpinfo.py, Additaionly AI was used to verify that the code I wrote was bug free and provided assitance to guide me to a more correct answer. Finally I used AI to help me understand the material that the HW assignments cover.
