@@ -1,9 +1,14 @@
-"""Entry point for assignement 2 expirements
+"""
+This is the entry point for Assignement 2 expirements
 
-Phase "q1q2": pick n random iperf3 servers (Q1b), run one test per server with the OS
-default congestion control, logging goodput (Q1c) and TCP_INFO stats (Q2).
-Phase "q3": on the same servers, run CUBIC, Reno and BBR for --reps repetitions (Q3a).
-Writes raw CSVs, summary tables, metadata and PDF plots to <out>/<run_id>/.
+Part 1 - iperf throughput application
+We pick n random iperf3 servers and run one test per server using our custom client with the OS
+default congestion control, logging goodput 
+
+Part 2 - While our cleint is sending data, in addition to sampling goodput, we record TCP_INFO stats.
+
+Part 3 - We run the same test as part 1 and part 2 collecting good put and TCP_INFO across the
+following congestion control algorithms: CUBIC, Reno, and BRR.
 """
 import argparse
 import csv

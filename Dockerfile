@@ -6,7 +6,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY q1.py tcpinfo.py plots.py experiment.py listed_iperf3_servers.csv ./
+COPY custom_iperf3_client.py tcpinfo.py plots.py experiment.py listed_iperf3_servers.csv ./
 
 ENTRYPOINT ["python3", "experiment.py"]
 CMD ["-n", "5", "-t", "60", "-i", "0.2", "-r", "3"]
