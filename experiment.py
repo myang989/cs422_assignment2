@@ -24,7 +24,7 @@ import matplotlib
 import numpy as np
 
 import plots
-from q1 import IperfError, load_servers, run_test, select_and_run
+from custom_iperf3_client import IperfError, load_servers, run_test, select_and_run
 from tcpinfo import TCP_INFO_FIELDS
 
 META_COLUMNS = [
