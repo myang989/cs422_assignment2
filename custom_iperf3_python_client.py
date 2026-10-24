@@ -9,9 +9,7 @@ import struct
 from enum import IntEnum
 import time
 import select
-import argparse
 import csv
-import os
 import random
 import re
 
@@ -20,6 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from tcpinfo import read_tcp_info
 """
 These states let both parties (client and server) know what is currently happening
 """
@@ -163,31 +162,26 @@ def recv_json(sock, max_len=1_000_000):
     return json.loads(recv_exact(sock, length).decode())
 
 """
-This function reads from the kernel, internal TCP stats for the given socket
-"""
-def read_bytes_acked(sock):
-    # give the current tcp info for this socket
-    info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
-    if len(info) < TCPI_BYTES_ACKED_OFFSET + 8:
-        raise IperfError(f"TCP_INFO too short ({len(info)} B) for tcpi_bytes_acked")
-    (acked,) = struct.unpack_from("=Q", info, TCPI_BYTES_ACKED_OFFSET)
-    # acked is the total number of bytes that the client has sent to the server and that the server has acknowleged (sent back an ACK)
-    return acked
-
-"""
-This function takes a sample of the cumulative bytes acked and takes the difference between it and the number of bytes from the previous sample
-basically at regular intervals we find:
-(diff in bytes / time diff) * 8
+Reads TCP_INFO from the data socket, stores all fields, and computes per-interval
+goodput ( (change in bytes_acked * 8) / change in time) plus retransmission and RTO deltas.
+Uses read_tcp_info from tcpinfo.py
 """
 def take_sample(sock, start, samples):
     now = time.monotonic()
-    acked = read_bytes_acked(sock)
-    sample = {"t_s": now - start, "bytes_acked": acked, "goodput_bps": None}
+    info = read_tcp_info(sock)
+    if "bytes_acked" not in info:
+        raise IperfError(f"TCP_INFO too short ({info['tcp_info_len']} B) for tcpi_bytes_acked")
+    sample = {"t_s": now - start, **info, "goodput_bps": None,
+              "retrans_delta": None, "bytes_retrans_delta": None, "rto_delta": None}
     if samples:
         prev = samples[-1]
         dt = sample["t_s"] - prev["t_s"]
         if dt > 0:
-            sample["goodput_bps"] = (acked - prev["bytes_acked"]) * 8 / dt
+            sample["goodput_bps"] = (info["bytes_acked"] - prev["bytes_acked"]) * 8 / dt
+        sample["retrans_delta"] = info.get("total_retrans", 0) - prev.get("total_retrans", 0)
+        sample["bytes_retrans_delta"] = info.get("bytes_retrans", 0) - prev.get("bytes_retrans", 0)
+        if "total_rto" in info:
+            sample["rto_delta"] = info["total_rto"] - prev.get("total_rto", 0)
     samples.append(sample)
 
 
@@ -279,6 +273,8 @@ def run_test(host, port, duration, block_size, interval, cc=None):
                 state = read_state(control_socket)
                 raise_for_state(control_socket, state)
         elapsed = time.monotonic() - start
+        
+        final_info = read_tcp_info(data_socket)
 
         # part 4  - tear down
         
@@ -292,11 +288,11 @@ def run_test(host, port, duration, block_size, interval, cc=None):
         # get_results() (iperf_api.c:2977) rejects the message if any of these fields is missing.
         client_results = {
             "cpu_util_total": 0, "cpu_util_user": 0, "cpu_util_system": 0,   # not measured
-            "sender_has_retransmits": 0,       # becomes 1 once we read TCP_INFO retransmits
+            "sender_has_retransmits": 1,       # we report tcpi_total_retrans, like iperf3 on Linux
             "streams": [{
                 "id": 1,                       # server's first stream id (iperf_add_stream())
                 "bytes": bytes_sent,
-                "retransmits": 0,
+                "retransmits": final_info.get("total_retrans", 0),
                 "jitter": 0, "errors": 0, "packets": 0,   # UDP-only fields
                 "start_time": 0, "end_time": elapsed,
             }],
@@ -318,6 +314,7 @@ def run_test(host, port, duration, block_size, interval, cc=None):
             "server_bytes": server_bytes,  # bytes the server reports receiving
             "cc_requested": cc,            # None until Q2/Q3
             "cc_used": cc_used,
+            "total_retrans": final_info.get("total_retrans"),
             "samples": samples,
         }
     finally:
@@ -363,6 +360,7 @@ def select_and_run(servers, n, max_attempts, duration, block_size, interval, cc,
         port = random.choice(ports)
         t0 = time.monotonic()
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        print(f"[{attempt}] testing {host}:{port} ...", flush=True)
         try:
             result = run_test(host, port, duration, block_size, interval, cc)
         except (IperfError, OSError, ValueError, KeyError) as e:
@@ -378,130 +376,3 @@ def select_and_run(servers, n, max_attempts, duration, block_size, interval, cc,
         successes.append(result)
         print(f"[{attempt}] OK   {host}:{port} - {len(successes)}/{n}")
     return successes
-
-"""
-Helper to write test output to a csv
-"""
-def write_csv(path, rows, fieldnames):
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-"""
-Creates the summary statistics of the tests for printing
-"""
-def summarize(results, run_id):
-    rows = []
-    for r in results:
-        g = np.array([s["goodput_bps"] for s in r["samples"] if s["goodput_bps"] is not None]) / 1e6
-        if g.size == 0:
-            continue
-        rows.append({"run_id": run_id, "host": r["host"], "port": r["port"], "cc": r["cc_used"],
-                     "n_samples": int(g.size),
-                     "min_mbps": round(float(np.min(g)), 3),
-                     "median_mbps": round(float(np.median(g)), 3),
-                     "mean_mbps": round(float(np.mean(g)), 3),
-                     "p95_mbps": round(float(np.percentile(g, 95)), 3)})
-    return rows
-
-"""
-Plots out goodput vs time graphs for each server
-"""
-def plot_goodput(results, path):
-    k = len(results)
-    if k == 0:
-        return
-    ncols = 2 if k > 1 else 1
-    nrows = (k + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 2.8 * nrows), squeeze=False, sharex=True)
-    for ax in axes.flat[k:]:
-        ax.set_visible(False)
-    for ax, r in zip(axes.flat, results):
-        pts = [(s["t_s"], s["goodput_bps"] / 1e6) for s in r["samples"] if s["goodput_bps"] is not None]
-        if pts:
-            t, g = zip(*pts)
-            ax.plot(t, g, linewidth=1)
-        ax.set_title(f'{r["host"]}:{r["port"]} ({r["cc_used"]})', fontsize=9)
-        ax.set_ylabel("goodput (Mbit/s)")
-        ax.set_ylim(bottom=0)
-        ax.grid(alpha=0.3)
-    for ax in axes[-1]:
-        ax.set_xlabel("time since TEST_RUNNING (s)")
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
-
-
-def main():
-    # collect command line args and then parse it into p
-    p = argparse.ArgumentParser(description="iperf3-compatible TCP goodput client (Assignment 2, Q1)")
-    p.add_argument("--servers", default="listed_iperf3_servers.csv", help="CSV server list")
-    p.add_argument("--host-column", default="IP/HOST")
-    p.add_argument("--port-column", default="PORT")
-    p.add_argument("--default-port", type=int, default=5201)
-    p.add_argument("-n", "--num-destinations", type=int, default=10)
-    p.add_argument("--max-attempts", type=int, default=None, help="default: 3 * n")
-    p.add_argument("-t", "--duration", type=int, default=60, help="seconds per destination")
-    p.add_argument("-i", "--interval", type=float, default=0.2, help="sampling interval (s)")
-    p.add_argument("-l", "--block-size", type=int, default=BLOCK_SIZE)
-    p.add_argument("--cc", default=None, help="congestion control on the data socket (default: OS default)")
-    p.add_argument("--seed", type=int, default=None)
-    p.add_argument("-o", "--out", default="results/q1")
-    args = p.parse_args()
-
-    # set seed for random and create output dir (we want reproduceable randomness)
-    seed = args.seed if args.seed is not None else int(time.time())
-    random.seed(seed)
-    run_id = time.strftime("%Y%m%d-%H%M%S")
-    max_attempts = args.max_attempts or 3 * args.num_destinations
-    os.makedirs(args.out, exist_ok=True)
-
-    # randomize the order of our possible servers
-    servers = load_servers(args.servers, args.host_column, args.port_column, args.default_port)
-    random.shuffle(servers)
-    print(f"Read {len(servers)} servers; seed {seed}; run {run_id}")
-
-    # run the tests for all servers.
-    attempts_log = []
-    results = select_and_run(servers, args.num_destinations, max_attempts, args.duration,
-                             args.block_size, args.interval, args.cc, attempts_log)
-
-    # write the output (attempts and chosen servers) 
-    write_csv(os.path.join(args.out, f"attempts_{run_id}.csv"), attempts_log,
-              ["attempt", "timestamp", "host", "port", "outcome", "reason", "attempt_s"])
-    write_csv(os.path.join(args.out, f"chosen_servers_{run_id}.csv"),
-              [{"host": r["host"], "port": r["port"]} for r in results], ["host", "port"])
-    
-    sample_rows = []
-    for r in results:
-        for s in r["samples"]:
-            sample_rows.append({"run_id": run_id, "host": r["host"], "port": r["port"], "cc": r["cc_used"],
-                                "interval_s": args.interval, "t_s": round(s["t_s"], 6),
-                                "bytes_acked": s["bytes_acked"],
-                                "goodput_bps": "" if s["goodput_bps"] is None else round(s["goodput_bps"], 1)})
-            
-    # write the goodput sampling output and summary stats
-    write_csv(os.path.join(args.out, f"samples_{run_id}.csv"), sample_rows,
-              ["run_id", "host", "port", "cc", "interval_s", "t_s", "bytes_acked", "goodput_bps"])
-    write_csv(os.path.join(args.out, f"tests_{run_id}.csv"),
-              [{k: r[k] for k in ("host", "port", "cc_requested", "cc_used", "duration_requested",
-                                  "elapsed", "block_size", "bytes_sent", "server_bytes")} for r in results],
-              ["host", "port", "cc_requested", "cc_used", "duration_requested", "elapsed",
-               "block_size", "bytes_sent", "server_bytes"])
-    summary = summarize(results, run_id)
-    write_csv(os.path.join(args.out, f"summary_{run_id}.csv"), summary,
-              ["run_id", "host", "port", "cc", "n_samples", "min_mbps", "median_mbps", "mean_mbps", "p95_mbps"])
-    plot_goodput(results, os.path.join(args.out, f"goodput_{run_id}.pdf"))
-
-    # shell output
-    print(f"\nrequested {args.num_destinations}, succeeded {len(results)}, "
-          f"attempts {len(attempts_log)}, shortfall {args.num_destinations - len(results)}")
-    print(f"{'host':<16}{'port':>6}{'cc':>8}{'min':>9}{'median':>9}{'mean':>9}{'p95':>9}  (Mbit/s)")
-    for row in summary:
-        print(f"{row['host']:<16}{row['port']:>6}{row['cc']:>8}{row['min_mbps']:>9.2f}"
-              f"{row['median_mbps']:>9.2f}{row['mean_mbps']:>9.2f}{row['p95_mbps']:>9.2f}")
-
-
-if __name__ == "__main__":
-    main()
